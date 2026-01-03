@@ -2,6 +2,8 @@
 
 Python implementation of **Recursive Language Models**, enabling LLMs to process arbitrarily long prompts by treating them as an external environment. The model writes Python code to examine, decompose, and recursively call itself over snippets.
 
+**Official repo here: [https://github.com/alexzhang13/rlm](https://github.com/alexzhang13/rlm)**
+
 Based on: [Recursive Language Models](https://arxiv.org/abs/2512.24601v1) (Zhang, Kraska, Khattab, 2025)
 
 ## Installation

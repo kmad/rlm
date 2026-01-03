@@ -48,7 +48,7 @@ def _safe_builtins() -> Dict[str, Any]:
     Keep this small. The model can still do plenty with strings/regex/lists,
     but cannot import modules, open files, etc.
     """
-    return {
+    builtins = {
         "len": len,
         "range": range,
         "min": min,
@@ -57,6 +57,10 @@ def _safe_builtins() -> Dict[str, Any]:
         "sorted": sorted,
         "enumerate": enumerate,
         "zip": zip,
+        "map": map,
+        "filter": filter,
+        "any": any,
+        "all": all,
         "set": set,
         "list": list,
         "dict": dict,
@@ -66,9 +70,22 @@ def _safe_builtins() -> Dict[str, Any]:
         "float": float,
         "bool": bool,
         "print": print,
-        # Regex is important for the paper’s “filtering via code” pattern
-        "re": re,
+        "abs": abs,
+        "round": round,
+        "isinstance": isinstance,
+        "type": type,
+        "hasattr": hasattr,
+        "getattr": getattr,
+        "slice": slice,
     }
+    # Add a fake import that just returns allowed modules
+    allowed_modules = {"re": re}
+    def safe_import(name, *args, **kwargs):
+        if name in allowed_modules:
+            return allowed_modules[name]
+        raise ImportError(f"Import of '{name}' is not allowed")
+    builtins["__import__"] = safe_import
+    return builtins
 
 
 @dataclass
@@ -116,10 +133,18 @@ class PythonSandbox:
         """
         Very lightweight checks. Not bulletproof.
         """
+        # Allow 're' import since we provide it
+        ALLOWED_IMPORTS = {"re"}
+
         tree = ast.parse(code)
         for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                raise SandboxError("Imports are disabled in this sandbox.")
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name not in ALLOWED_IMPORTS:
+                        raise SandboxError(f"Import of '{alias.name}' is disabled.")
+            if isinstance(node, ast.ImportFrom):
+                if node.module not in ALLOWED_IMPORTS:
+                    raise SandboxError(f"Import from '{node.module}' is disabled.")
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 if node.func.id in {"open", "exec", "eval", "__import__"}:
                     raise SandboxError(f"Call to {node.func.id} is disabled.")
@@ -155,20 +180,40 @@ class RLMResult:
     trace: list[RLMTraceStep] = field(default_factory=list)
 
 
-FINAL_RE = re.compile(r"^\s*FINAL\((.*)\)\s*$", re.DOTALL)
-FINAL_VAR_RE = re.compile(r"^\s*FINAL_VAR\(\s*([A-Za-z_]\w*)\s*\)\s*$", re.DOTALL)
-CODE_FENCE_RE = re.compile(r"^```(?:python)?\s*\n(.*?)\n```\s*$", re.DOTALL)
+FINAL_RE = re.compile(r"FINAL\(([^)]*)\)", re.DOTALL)
+FINAL_VAR_RE = re.compile(r"FINAL_VAR\(\s*([A-Za-z_]\w*)\s*\)", re.DOTALL)
+# Match ```repl, ```python, or bare ``` code blocks
+CODE_FENCE_RE = re.compile(r"```(?:repl|python)?\s*\n(.*?)\n```", re.DOTALL)
 
 
-def _extract_code(model_output: str) -> str:
+def _extract_code(model_output: str) -> tuple[str | None, bool]:
     """
-    Strip markdown code fences if present - some models wrap code in ```python ... ```.
+    Extract code from model output. Returns (code, found_final).
+
+    The paper uses ```repl blocks for code. We also accept ```python and bare ```.
+    If FINAL() or FINAL_VAR() is found, returns (None, True) to signal termination.
     """
     model_output = model_output.strip()
-    m = CODE_FENCE_RE.match(model_output)
-    if m:
-        return m.group(1).strip()
-    return model_output
+
+    # Check for FINAL statements first
+    if FINAL_RE.search(model_output) or FINAL_VAR_RE.search(model_output):
+        return None, True
+
+    # Look for code blocks
+    matches = CODE_FENCE_RE.findall(model_output)
+    if matches:
+        # Join all code blocks if multiple
+        return "\n\n".join(m.strip() for m in matches), False
+
+    # If output looks like Python code (starts with common patterns), use it directly
+    first_line = model_output.split('\n')[0].strip()
+    code_indicators = ['import ', 'from ', 'def ', 'class ', 'for ', 'while ', 'if ',
+                       'print(', 'context', 'llm_query', '#', 'result', 'answer', 'chunk']
+    if any(first_line.startswith(ind) or first_line.startswith(ind.upper()) for ind in code_indicators):
+        return model_output, False
+
+    # Otherwise, not valid code - return None to prompt retry
+    return None, False
 
 
 class RecursiveLanguageModel:
@@ -185,43 +230,76 @@ class RecursiveLanguageModel:
         self._subcall_cache: Dict[Tuple[str, str], str] = {}
 
     def run(self, prompt: str, task: str) -> RLMResult:
-        # Initialize REPL environment with prompt P
-        sandbox = PythonSandbox(initial_globals={"P": prompt})
+        # Normalize common unicode characters that cause search issues
+        # (PDFs often have en-dashes, smart quotes, etc.)
+        normalized_prompt = prompt.replace('\u2013', '-').replace('\u2014', '-')  # en-dash, em-dash
+        normalized_prompt = normalized_prompt.replace('\u2018', "'").replace('\u2019', "'")  # smart quotes
+        normalized_prompt = normalized_prompt.replace('\u201c', '"').replace('\u201d', '"')
+
+        # Initialize REPL environment with context variable (paper uses 'context')
+        sandbox = PythonSandbox(initial_globals={"context": normalized_prompt})
 
         # Install helper functions that *the model can call from code*
         sandbox.globals.update(self._tooling(sandbox=sandbox, task=task, depth=0))
 
-        system_prompt = self._system_prompt()
-        user_prompt = self._user_prompt_intro(prompt=prompt, task=task)
+        system_prompt = self._system_prompt(prompt=normalized_prompt)
+        user_prompt = self._user_prompt_intro(prompt=normalized_prompt, task=task)
 
         trace: list[RLMTraceStep] = []
+        code_executed = False  # Track if model has explored the context
 
         for step in range(self.cfg.max_steps):
             model_out = self.root_lm.complete(system_prompt=system_prompt, user_prompt=user_prompt).strip()
 
-            # 1) If model returns FINAL(...)
-            m = FINAL_RE.match(model_out)
-            if m:
-                ans = m.group(1).strip()
-                return RLMResult(answer=ans, trace=trace)
+            # Extract code or check for FINAL
+            code, found_final = _extract_code(model_out)
 
-            # 2) If model returns FINAL_VAR(name) (paper-style tag)
-            m2 = FINAL_VAR_RE.match(model_out)
-            if m2:
-                var = m2.group(1)
-                if var not in sandbox.globals:
-                    obs = f"ERROR: variable {var!r} not found in environment."
-                    trace.append(RLMTraceStep(model_output=model_out, executed_code=None, observation=obs, error=obs))
-                    user_prompt = self._next_user_prompt(task, step, obs)
-                    continue
-                ans = str(sandbox.globals[var])
-                return RLMResult(answer=ans, trace=trace)
+            if found_final and not code_executed:
+                # Don't allow FINAL before exploring the context
+                obs = ""
+                err = "You must explore the context with ```repl code BEFORE providing a FINAL answer. Write code to search/examine the context first."
+                trace.append(RLMTraceStep(model_output=model_out, executed_code=None, observation=obs, error=err))
+                user_prompt = self._next_user_prompt(task, step, obs, err)
+                continue
 
-            # 3) Otherwise treat output as Python code to execute
-            code = _extract_code(model_out)
+            if found_final and code_executed:
+                # Extract the actual answer from FINAL() or FINAL_VAR()
+                m = FINAL_RE.search(model_out)
+                if m:
+                    ans = m.group(1).strip()
+                    return RLMResult(answer=ans, trace=trace)
+
+                m2 = FINAL_VAR_RE.search(model_out)
+                if m2:
+                    var = m2.group(1)
+                    if var not in sandbox.globals:
+                        obs = f"ERROR: variable {var!r} not found in environment."
+                        trace.append(RLMTraceStep(model_output=model_out, executed_code=None, observation=obs, error=obs))
+                        user_prompt = self._next_user_prompt(task, step, obs)
+                        continue
+                    ans = str(sandbox.globals[var])
+                    return RLMResult(answer=ans, trace=trace)
+
+            if code is None:
+                # Model didn't output valid code - prompt to retry
+                obs = ""
+                err = "Please output Python code in ```repl blocks or provide FINAL(answer)/FINAL_VAR(varname)."
+                trace.append(RLMTraceStep(model_output=model_out, executed_code=None, observation=obs, error=err))
+                user_prompt = self._next_user_prompt(task, step, obs, err)
+                continue
+
+            # Execute the code
             exec_res = sandbox.exec(code)
             obs = exec_res.stdout.strip()
             err = exec_res.error
+
+            # Mark that code has been executed (even if it had errors)
+            if not err:
+                code_executed = True
+
+            # Truncate very long output
+            if len(obs) > 8000:
+                obs = obs[:8000] + "\n... [output truncated]"
 
             trace.append(RLMTraceStep(
                 model_output=model_out,
@@ -245,90 +323,43 @@ class RecursiveLanguageModel:
     def _tooling(self, sandbox: PythonSandbox, task: str, depth: int) -> Dict[str, Any]:
         cfg = self.cfg
 
-        def peek(start: int = 0, length: int = 500) -> str:
-            length = max(0, min(length, cfg.max_peek_chars))
-            return sandbox.globals["P"][start:start + length]
-
-        def lines(i: int = 0, j: int = 10) -> str:
-            parts = sandbox.globals["P"].splitlines()
-            i = max(0, i)
-            j = min(len(parts), j)
-            return "\n".join(parts[i:j])
-
-        def grep(pattern: str, max_matches: int = 5, context: int = 80) -> str:
-            # Simple regex search over P; returns small excerpts.
-            text = sandbox.globals["P"]
-            out = []
-            for m in re.finditer(pattern, text, flags=re.IGNORECASE):
-                s = max(0, m.start() - context)
-                e = min(len(text), m.end() + context)
-                out.append(text[s:e].replace("\n", " "))
-                if len(out) >= max_matches:
-                    break
-            return "\n---\n".join(out) if out else ""
-
-        def chunk_by_chars(size: int = 4000, overlap: int = 200) -> list[str]:
-            text = sandbox.globals["P"]
-            size = max(200, size)
-            overlap = max(0, min(overlap, size // 2))
-            chunks = []
-            i = 0
-            while i < len(text):
-                chunks.append(text[i:i + size])
-                i += (size - overlap)
-            return chunks
-
-        def chunk_by_lines(lines_per_chunk: int = 50, overlap: int = 5) -> list[str]:
+        def llm_query(prompt: str) -> str:
             """
-            Split P into chunks by line count - useful for line-oriented tasks like OOLONG.
-            """
-            all_lines = sandbox.globals["P"].splitlines()
-            lines_per_chunk = max(1, lines_per_chunk)
-            overlap = max(0, min(overlap, lines_per_chunk // 2))
-            chunks = []
-            i = 0
-            while i < len(all_lines):
-                chunks.append("\n".join(all_lines[i:i + lines_per_chunk]))
-                i += (lines_per_chunk - overlap)
-            return chunks
-
-        def subcall(snippet: str, question: Optional[str] = None) -> str:
-            """
-            Recursively call a sub-LM on a smaller snippet.
-            Mirrors the paper's "recursive call over snippets" mechanism.
+            Query a sub-LLM with the given prompt. The sub-LLM can handle ~500K chars.
+            This is the paper's main recursive mechanism.
             """
             if depth >= cfg.max_recursion_depth:
-                return "[subcall blocked: max recursion depth reached]"
+                return "[llm_query blocked: max recursion depth reached]"
 
-            snippet = snippet[: cfg.max_snippet_chars_for_subcall]
-            q = question or task
+            prompt = prompt[: cfg.max_snippet_chars_for_subcall]
 
-            key = (snippet, q)
+            key = (prompt, task)
             if cfg.cache_subcalls and key in self._subcall_cache:
                 return self._subcall_cache[key]
 
-            # In a deeper recursion setting, you could call another RecursiveLanguageModel here.
-            # For "depth=1" (the paper’s common setup), treat subcalls as plain LM calls.
             sys = (
-                "You are a sub-model. Answer the question using ONLY the provided snippet. "
-                "If the snippet is insufficient, say what is missing."
+                "You are a helpful sub-model. Answer the question or complete the task "
+                "using ONLY the information provided in the prompt. Be concise and direct."
             )
-            user = f"QUESTION:\n{q}\n\nSNIPPET:\n{snippet}"
-            resp = self.sub_lm.complete(system_prompt=sys, user_prompt=user).strip()
+            resp = self.sub_lm.complete(system_prompt=sys, user_prompt=prompt).strip()
 
             if cfg.cache_subcalls:
                 self._subcall_cache[key] = resp
             return resp
 
+        # Also keep 'subcall' as an alias for backwards compatibility
+        def subcall(snippet: str, question: Optional[str] = None) -> str:
+            q = question or task
+            return llm_query(f"{q}\n\nContext:\n{snippet}")
+
         return {
-            "peek": peek,
-            "lines": lines,
-            "grep": grep,
-            "chunk_by_chars": chunk_by_chars,
-            "chunk_by_lines": chunk_by_lines,
-            "subcall": subcall,
-            "TASK": task,
-            "DEPTH": depth,
+            "llm_query": llm_query,
+            "subcall": subcall,  # backwards compat
+            "re": re,  # regex module for filtering
+            "len": len,
+            "range": range,
+            "enumerate": enumerate,
+            "print": print,
         }
 
     # -----------------------------
@@ -336,40 +367,73 @@ class RecursiveLanguageModel:
     # -----------------------------
 
     @staticmethod
-    def _system_prompt() -> str:
-        return (
-            "You are operating as a Recursive Language Model inside a Python REPL.\n"
-            "The full user input is stored as variable P (a string) in the environment.\n"
-            "You can write Python code to inspect P using helper functions:\n"
-            "- peek(start, length) - view substring of P\n"
-            "- lines(i, j) - view lines i to j of P\n"
-            "- grep(pattern, max_matches=5, context=80) - regex search with context\n"
-            "- chunk_by_chars(size, overlap) - split P into overlapping char chunks\n"
-            "- chunk_by_lines(lines_per_chunk, overlap) - split P into line-based chunks\n"
-            "- subcall(snippet, question=...) - delegate to a sub-model on a snippet\n\n"
-            "Rules:\n"
-            "- Prefer selective inspection (grep/peek) over printing huge text.\n"
-            "- Use subcall() for semantic tasks on chunks that need LM reasoning.\n"
-            "- When ready to answer, output FINAL(<answer>) or FINAL_VAR(<varname>).\n"
-            "- Output ONLY Python code OR a FINAL/FINAL_VAR statement. No explanations.\n"
-        )
+    def _system_prompt(prompt: str) -> str:
+        context_len = len(prompt)
+        return f"""You are tasked with answering a query with associated context. You can access, transform, and analyze this context interactively in a REPL environment that can recursively query sub-LLMs.
+
+Your context is a string with {context_len} total characters.
+
+The REPL environment is initialized with:
+1. A 'context' variable containing the full input text.
+2. A 'llm_query(prompt)' function to query a sub-LLM (can handle ~500K chars).
+3. The 'print()' function to view outputs.
+4. The 're' module for regex operations.
+
+When you want to execute Python code, wrap it in triple backticks with 'repl':
+```repl
+# Example: peek at first 500 chars
+print(context[:500])
+```
+
+Example strategy for long contexts:
+```repl
+# Split into chunks and query each
+chunk_size = len(context) // 5
+answers = []
+for i in range(5):
+    start = i * chunk_size
+    end = start + chunk_size if i < 4 else len(context)
+    chunk = context[start:end]
+    answer = llm_query(f"Find relevant info for the query in this chunk:\\n{{chunk}}")
+    answers.append(answer)
+    print(f"Chunk {{i}}: {{answer[:200]}}")
+
+final_answer = llm_query(f"Combine these findings to answer the query:\\n" + "\\n".join(answers))
+print(final_answer)
+```
+
+IMPORTANT RULES:
+1. You MUST explore the context with ```repl code BEFORE answering
+2. Do NOT use FINAL_VAR(x) unless you have already created variable x in a previous code execution
+3. When you have found the answer, use FINAL(your answer here) directly - don't reference variables
+
+Example workflow:
+Step 1: ```repl code to search/explore
+Step 2: See output, refine search if needed
+Step 3: FINAL(the answer based on what you found)
+
+Do NOT just say "I will do this" - execute your plan immediately in ```repl blocks."""
 
     @staticmethod
     def _user_prompt_intro(prompt: str, task: str) -> str:
-        return (
-            f"TASK:\n{task}\n\n"
-            f"ENV INFO:\n- len(P) = {len(prompt)} characters\n"
-            "Write Python code to solve the task by selectively inspecting P.\n"
-        )
+        # Paper approach: tell the model about the context but DON'T show it
+        # Force the model to use the REPL to explore
+        num_lines = prompt.count('\n') + 1
+        return f"""QUERY: {task}
+
+CONTEXT INFO: {len(prompt):,} characters, ~{num_lines:,} lines.
+
+IMPORTANT: The context is NOT shown here. You MUST write ```repl code to explore the `context` variable.
+Start by examining relevant portions of the context to find information needed to answer the query."""
 
     @staticmethod
     def _next_user_prompt(task: str, step: int, stdout: str, err: Optional[str] = None) -> str:
-        msg = f"TASK:\n{task}\n\nSTEP {step} OBSERVATION:\n"
+        msg = f"QUERY: {task}\n\nSTEP {step} OUTPUT:\n"
         if stdout:
             msg += f"{stdout}\n"
         if err:
             msg += f"\nERROR:\n{err}\n"
-        msg += "\nWrite code to continue, or output FINAL(<answer>) / FINAL_VAR(<varname>)."
+        msg += "\nContinue with ```repl code, or provide FINAL(answer) / FINAL_VAR(varname)."
         return msg
 
 
@@ -447,14 +511,17 @@ def main():
 
     if args.verbose:
         print("=" * 60)
-        print("TRACE")
+        print(f"TRACE ({len(result.trace)} steps)")
         print("=" * 60)
         for i, step in enumerate(result.trace):
             print(f"\n--- Step {i} ---")
-            print(f"Code:\n{step.executed_code}")
-            print(f"Output:\n{step.observation}")
+            if step.executed_code:
+                print(f"Code:\n{step.executed_code}")
+            if step.observation:
+                obs = step.observation[:1000] + "..." if len(step.observation) > 1000 else step.observation
+                print(f"Output:\n{obs}")
             if step.error:
-                print(f"Error:\n{step.error}")
+                print(f"Error: {step.error}")
         print("=" * 60)
 
     print(f"\nANSWER: {result.answer}")

@@ -1,0 +1,12 @@
+[project]
+name = "rlm"
+version = "0.1.0"
+description = "Recursive Language Models - inference strategy for handling arbitrarily long prompts"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "litellm>=1.0.0",
+]
+
+[project.scripts]
+rlm = "rlm:main"
